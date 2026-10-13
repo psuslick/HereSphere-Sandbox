@@ -1136,7 +1136,7 @@ namespace HereSphereSandbox
                 if (String.IsNullOrEmpty(item.ThumbnailUrl) && Uri.TryCreate(uri,WebUtility.HtmlDecode(imageMeta ?? ""),out absolute) && SafeThumbnailUrl(absolute.ToString())) item.ThumbnailUrl=absolute.ToString();
                 item.State="listed";
             }
-            catch(Exception ex) {item.State="unverified";}
+            catch(Exception) {item.State="unverified";}
         }
         private static string ExtractMeta(string html,string names)
         {
