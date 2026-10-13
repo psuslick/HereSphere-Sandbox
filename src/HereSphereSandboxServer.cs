@@ -79,6 +79,7 @@ namespace HereSphereSandbox
             _ytDlpPath = ytDlpPath;
             _publicBaseUrl = String.IsNullOrWhiteSpace(publicBaseUrl) ? ("http://127.0.0.1:" + port.ToString(CultureInfo.InvariantCulture)) : publicBaseUrl.TrimEnd('/');
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            StartCatalog();
             ServicePointManager.DefaultConnectionLimit = 64;
 
             Uri listenUri = new Uri(_publicBaseUrl);
@@ -87,17 +88,17 @@ namespace HereSphereSandbox
                 throw new InvalidOperationException("The Sandbox listener requires a numeric guest IP address.");
             TcpListener listener = new TcpListener(listenAddress, port);
             listener.Start(64);
-            Console.WriteLine("HereSphere Sandbox service listening on 0.0.0.0:" + port.ToString(CultureInfo.InvariantCulture));
+            Console.WriteLine("HereSphere Sandbox service listening on " + listenAddress.ToString() + ":" + port.ToString(CultureInfo.InvariantCulture));
 
             while (true)
             {
                 TcpClient client = listener.AcceptTcpClient();
                 client.NoDelay = true;
-                Task.Run(() => HandleClient(client));
+                Task.Run(() => HandleClient(client, false));
             }
         }
 
-        private static void HandleClient(TcpClient client)
+        private static void HandleClient(TcpClient client, bool isAdmin)
         {
             using (client)
             {
@@ -108,7 +109,7 @@ namespace HereSphereSandbox
                     stream.WriteTimeout = 30000;
                     RequestData req = ReadRequest(stream);
                     if (req == null) return;
-                    Dispatch(req, stream);
+                    Dispatch(req, stream, isAdmin);
                 }
                 catch (Exception ex)
                 {
@@ -191,7 +192,7 @@ namespace HereSphereSandbox
             return req;
         }
 
-        private static void Dispatch(RequestData req, NetworkStream stream)
+        private static void Dispatch(RequestData req, NetworkStream stream, bool isAdmin)
         {
             Uri targetUri;
             if (!Uri.TryCreate("http://localhost" + req.Target, UriKind.Absolute, out targetUri))
@@ -200,6 +201,7 @@ namespace HereSphereSandbox
                 return;
             }
             string path = targetUri.AbsolutePath;
+            if (isAdmin) { HandleAdmin(req, stream, path); return; }
 
             // The native HereSphere client needs no browser CORS permission. A public
             // web page must not be able to read this guest's local media proxy.
@@ -234,10 +236,10 @@ namespace HereSphereSandbox
             {
                 string html = "<!doctype html><html><head><meta charset=\"utf-8\"><title>HereSphere Sandbox Server</title></head>" +
                     "<body style=\"font-family:Segoe UI,Arial;max-width:850px;margin:40px auto;line-height:1.5\">" +
-                    "<h1>HereSphere Sandbox Server</h1><p><b>Status:</b> running inside Windows Sandbox.</p>" +
+                    "<h1>HereSphere Sandbox Server v0.5</h1><p><b>Status:</b> running inside Windows Sandbox.</p>" +
                     "<p>Set HereSphere Link Server to <code>" + WebUtility.HtmlEncode(_publicBaseUrl) + "</code>.</p>" +
                     "<p>This alpha build supports Link Server streaming through <code>/stream</code>. Direct media URLs, yt-dlp extraction, static HTML media discovery, byte ranges, and HLS playlist rewriting are supported.</p>" +
-                    "<p>Downloading and a persistent library are intentionally disabled in this disposable build.</p></body></html>";
+                    "<p>The HereSphere library is at <code>/heresphere</code>. Open the management UI <b>inside Windows Sandbox</b> at <code>http://127.0.0.1:5001</code>.</p></body></html>";
                 WriteBytes(stream, 200, "text/html; charset=utf-8", Utf8.GetBytes(html), null);
                 return;
             }
@@ -264,12 +266,14 @@ namespace HereSphereSandbox
                 return;
             }
 
-            if (path == "/heresphere")
+            if (path == "/heresphere" || path.StartsWith("/heresphere/", StringComparison.Ordinal))
             {
-                WriteJson(stream, 501, new Dictionary<string, object> {
-                    { "success", false },
-                    { "message", "Optimized HereSphere library browsing is not implemented in this alpha build; use the Link Server streaming function." }
-                });
+                HandleHereSphere(req, stream, path);
+                return;
+            }
+            if (path.StartsWith("/thumb/", StringComparison.Ordinal) && req.Method == "GET")
+            {
+                HandleThumb(path.Substring(7), stream);
                 return;
             }
 
@@ -801,7 +805,7 @@ namespace HereSphereSandbox
             StringBuilder sb = new StringBuilder();
             sb.Append("HTTP/1.1 ").Append(status).Append(' ').Append(reason).Append("\r\n");
             sb.Append("Connection: close\r\n");
-            sb.Append("Server: HereSphereSandbox/0.4\r\n");
+            sb.Append("Server: HereSphereSandbox/0.5\r\n");
             if (!String.IsNullOrEmpty(contentType)) sb.Append("Content-Type: ").Append(SanitizeHeader(contentType)).Append("\r\n");
             if (headers != null)
             {
@@ -853,6 +857,480 @@ namespace HereSphereSandbox
             IEnumerable<string> values;
             if (response.Headers.TryGetValues(name, out values) || response.Content.Headers.TryGetValues(name, out values))
                 target[name] = String.Join(", ", values.ToArray());
+        }
+        // v0.5 catalog: all changes to these collections are disposable Sandbox-session state.
+        private sealed class CatalogItem
+        {
+            public string Id, Url, Title, Group, Source, ThumbnailUrl, Description, State;
+            public long DurationMs;
+        }
+        private static readonly ConcurrentDictionary<string, CatalogItem> Catalog = new ConcurrentDictionary<string, CatalogItem>();
+        private static readonly ConcurrentDictionary<string, byte[]> ImageCache = new ConcurrentDictionary<string, byte[]>();
+        private static readonly ConcurrentDictionary<string, string> ImageTypes = new ConcurrentDictionary<string, string>();
+        private static readonly object SourcesLock = new object();
+        private static List<string> IndividualSources = new List<string>();
+        private static List<string> WebsiteSources = new List<string>();
+        private static int ScanBusy;
+        private static int MaxItemsPerSite = 48;
+        private static int MaxPagesPerSite = 3;
+        private static string ScanStatus = "Waiting";
+        private static int ScanGeneration;
+        private static readonly string SourceRoot = @"C:\SandboxBootstrap\HereSphere\Sources";
+        private static readonly string UiPath = @"C:\App\ui\index.html";
+
+        private static void StartCatalog()
+        {
+            lock (SourcesLock)
+            {
+                IndividualSources = ReadSourceFile(Path.Combine(SourceRoot, "videos.txt"));
+                WebsiteSources = ReadSourceFile(Path.Combine(SourceRoot, "websites.txt"));
+            }
+            Task.Run(() => CatalogScan());
+            Task.Run(() => RunAdminListener());
+            Console.WriteLine("Management UI: http://127.0.0.1:5001 (Sandbox browser only)");
+        }
+        private static List<string> ReadSourceFile(string path)
+        {
+            if (!File.Exists(path)) return new List<string>();
+            return NormalizeUrls(File.ReadAllText(path));
+        }
+        private static List<string> NormalizeUrls(string input)
+        {
+            List<string> result = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string rawLine in (input ?? "").Split(new[] {'\r','\n'}, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string line = rawLine.Trim();
+                if (line.Length == 0 || line.StartsWith("#") || line.Length > 3000) continue;
+                Uri uri; string reason;
+                if (TryValidatePublicHttpUri(line, out uri, out reason) && seen.Add(uri.ToString())) result.Add(uri.ToString());
+                if (result.Count >= 250) break;
+            }
+            return result;
+        }
+        private static void RunAdminListener()
+        {
+            try
+            {
+                TcpListener listener = new TcpListener(IPAddress.Loopback, 5001);
+                listener.Start(16);
+                while (true)
+                {
+                    TcpClient c = listener.AcceptTcpClient();
+                    c.NoDelay = true;
+                    Task.Run(() => HandleClient(c, true));
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("Management UI failed: " + ex.GetType().Name); }
+        }
+        private static bool HandleAdmin(RequestData req, NetworkStream stream, string path)
+        {
+            string host;
+            if (!req.Headers.TryGetValue("Host", out host) ||
+                !(String.Equals(host, "127.0.0.1:5001", StringComparison.OrdinalIgnoreCase) ||
+                  String.Equals(host, "localhost:5001", StringComparison.OrdinalIgnoreCase)))
+            { WriteJson(stream, 403, Error("Management interface is guest-loopback only.")); return true; }
+            string origin;
+            if (req.Headers.TryGetValue("Origin", out origin) &&
+                !(String.Equals(origin, "http://127.0.0.1:5001", StringComparison.OrdinalIgnoreCase) ||
+                  String.Equals(origin, "http://localhost:5001", StringComparison.OrdinalIgnoreCase)))
+            { WriteJson(stream, 403, Error("Cross-origin management requests are blocked.")); return true; }
+            if (path == "/" && req.Method == "GET")
+            {
+                if (!File.Exists(UiPath)) { WriteJson(stream, 500, Error("UI file missing in cloned repository.")); return true; }
+                byte[] html = File.ReadAllBytes(UiPath);
+                WriteBytes(stream, 200, "text/html; charset=utf-8", html,
+                    new Dictionary<string,string>{{"Cache-Control","no-store"},{"Content-Security-Policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"},{"X-Content-Type-Options","nosniff"}});
+                return true;
+            }
+            if (path == "/api/catalog" && req.Method == "GET")
+            {
+                List<object> entries = Catalog.Values.OrderBy(x => x.Group).ThenBy(x => x.Source).ThenBy(x => x.Title).Select(x => (object)CatalogPayload(x)).ToList();
+                List<string> videos, websites;
+                lock (SourcesLock) { videos = new List<string>(IndividualSources); websites = new List<string>(WebsiteSources); }
+                WriteJson(stream, 200, new Dictionary<string,object> {
+                    {"success",true},{"items",entries},{"videos",videos},{"websites",websites},
+                    {"scanning",Interlocked.CompareExchange(ref ScanBusy, 0, 0) != 0},
+                    {"status",ScanStatus},{"maxItemsPerSite",MaxItemsPerSite},{"maxPagesPerSite",MaxPagesPerSite}
+                });
+                return true;
+            }
+            if (path == "/api/sources" && req.Method == "POST")
+            {
+                Dictionary<string,object> data = DecodeObject(req.Body);
+                lock (SourcesLock)
+                {
+                    IndividualSources = NormalizeUrls(GetString(data,"videos"));
+                    WebsiteSources = NormalizeUrls(GetString(data,"websites"));
+                }
+                WriteJson(stream, 200, new Dictionary<string,object>{{"success",true},{"message","Session sources updated; use Rescan to apply."}});
+                return true;
+            }
+            if (path == "/api/settings" && req.Method == "POST")
+            {
+                Dictionary<string,object> data = DecodeObject(req.Body);
+                MaxItemsPerSite = ReadClampedInt(data,"maxItemsPerSite",MaxItemsPerSite,5,120);
+                MaxPagesPerSite = ReadClampedInt(data,"maxPagesPerSite",MaxPagesPerSite,1,5);
+                WriteJson(stream,200,new Dictionary<string,object>{{"success",true}});
+                return true;
+            }
+            if (path == "/api/scan" && req.Method == "POST")
+            {
+                if (Interlocked.CompareExchange(ref ScanBusy,1,0) == 0)
+                {
+                    Task.Run(() => CatalogScan(true));
+                    WriteJson(stream,202,new Dictionary<string,object>{{"success",true},{"message","Scan started."}});
+                }
+                else WriteJson(stream,200,new Dictionary<string,object>{{"success",false},{"message","Scan already running."}});
+                return true;
+            }
+            if (path.StartsWith("/thumb/",StringComparison.Ordinal) && req.Method == "GET")
+            {
+                HandleThumb(path.Substring(7),stream);
+                return true;
+            }
+            WriteJson(stream,404,Error("Management route not found."));
+            return true;
+        }
+        private static Dictionary<string,object> DecodeObject(byte[] bytes)
+        {
+            try { return Json.DeserializeObject(Utf8.GetString(bytes ?? new byte[0])) as Dictionary<string,object> ?? new Dictionary<string,object>(); }
+            catch { return new Dictionary<string,object>(); }
+        }
+        private static int ReadClampedInt(Dictionary<string,object> obj, string key, int fallback, int min, int max)
+        {
+            object value; int result;
+            return obj.TryGetValue(key,out value) && Int32.TryParse(Convert.ToString(value,CultureInfo.InvariantCulture),out result)
+                ? Math.Max(min,Math.Min(max,result)) : fallback;
+        }
+        private static Dictionary<string,object> CatalogPayload(CatalogItem item)
+        {
+            return new Dictionary<string,object> {
+                {"id",item.Id},{"url",item.Url},{"title",item.Title},{"group",item.Group},{"source",item.Source},
+                {"description",item.Description ?? ""},{"durationMs",item.DurationMs},
+                {"thumbnail", "/thumb/"+item.Id},{"hasThumbnail",!String.IsNullOrWhiteSpace(item.ThumbnailUrl)},
+                {"state",item.State ?? "pending"}
+            };
+        }
+        private static void CatalogScan(bool alreadyClaimed = false)
+        {
+            if (!alreadyClaimed && Interlocked.CompareExchange(ref ScanBusy,1,0) != 0) return;
+            int generation = Interlocked.Increment(ref ScanGeneration);
+            try
+            {
+                ScanStatus = "Reading source lists";
+                Catalog.Clear(); ImageCache.Clear(); ImageTypes.Clear();
+                List<string> videos, websites;
+                lock(SourcesLock) { videos = new List<string>(IndividualSources); websites = new List<string>(WebsiteSources); }
+                foreach (string url in videos)
+                {
+                    CatalogItem item = AddCatalogItem(url,"individual","Individual Videos",null,null);
+                    if (item != null) { ScanStatus = "Indexing individual videos"; ProbeMetadata(item); }
+                }
+                foreach (string website in websites)
+                {
+                    ScanStatus = "Discovering videos on " + SafeSourceName(website);
+                    try { DiscoverWebsite(website); }
+                    catch(Exception ex) { Console.WriteLine("Discovery failed ("+SafeSourceName(website)+"): "+ex.GetType().Name); }
+                }
+                ScanStatus = "Complete: " + Catalog.Count.ToString(CultureInfo.InvariantCulture) + " entries";
+            }
+            catch (Exception ex) { ScanStatus = "Scan error: " + ex.GetType().Name; }
+            finally { Interlocked.Exchange(ref ScanBusy,0); }
+        }
+        private static string SafeSourceName(string url)
+        {
+            Uri uri; return Uri.TryCreate(url,UriKind.Absolute,out uri) ? uri.Host : "source";
+        }
+        private static CatalogItem AddCatalogItem(string url, string group, string source, string title, string thumb)
+        {
+            Uri uri; string reason;
+            if (!TryValidatePublicHttpUri(url,out uri,out reason)) return null;
+            string normalized = uri.AbsoluteUri;
+            string id = StableId(group+"|"+normalized);
+            CatalogItem item = new CatalogItem { Id=id, Url=uri.ToString(), Group=group, Source=source,
+                Title=String.IsNullOrWhiteSpace(title)?ReadableName(uri):title,ThumbnailUrl=thumb, State="queued" };
+            return Catalog.GetOrAdd(id,item);
+        }
+        private static string StableId(string input)
+        {
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Utf8.GetBytes(input))).Replace("-", "").Substring(0,24).ToLowerInvariant();
+        }
+        private static string ReadableName(Uri uri)
+        {
+            string name = uri.Segments.Length>0 ? Uri.UnescapeDataString(uri.Segments[uri.Segments.Length-1]).Trim('/') : "";
+            return String.IsNullOrWhiteSpace(name)?uri.Host:name.Replace('-',' ').Replace('_',' ');
+        }
+        private static Dictionary<string,object> ProbeYtDlp(string url, bool flat, int count, int timeoutMs)
+        {
+            if (String.IsNullOrEmpty(_ytDlpPath) || !File.Exists(_ytDlpPath)) return null;
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = _ytDlpPath; psi.CreateNoWindow=true; psi.UseShellExecute=false;
+            psi.RedirectStandardOutput=true; psi.RedirectStandardError=true;
+            psi.StandardOutputEncoding=Encoding.UTF8; psi.StandardErrorEncoding=Encoding.UTF8;
+            psi.Arguments = "--no-config --no-plugin-dirs --no-remote-components --no-cache-dir --skip-download --dump-single-json --no-warnings " +
+                (flat ? "--flat-playlist --playlist-end " + count.ToString(CultureInfo.InvariantCulture) + " " : "--no-playlist ") +
+                "-- " + QuoteArg(url);
+            using (Process p = new Process())
+            {
+                p.StartInfo=psi; p.Start();
+                Task<string> stdout=p.StandardOutput.ReadToEndAsync(); Task<string> stderr=p.StandardError.ReadToEndAsync();
+                if(!p.WaitForExit(timeoutMs)) {try{p.Kill();}catch{} return null;}
+                if (!Task.WaitAll(new Task[]{stdout,stderr},5000) || p.ExitCode!=0 || stdout.Result.Length>12*1024*1024) return null;
+                try {return Json.DeserializeObject(stdout.Result) as Dictionary<string,object>;} catch {return null;}
+            }
+        }
+        private static long DurationMs(Dictionary<string,object> info)
+        {
+            object value; double result;
+            return info.TryGetValue("duration",out value) && value!=null && Double.TryParse(Convert.ToString(value,CultureInfo.InvariantCulture), NumberStyles.Any,CultureInfo.InvariantCulture,out result)
+                 ? (long)Math.Min(Int32.MaxValue,Math.Max(0,result*1000)) : 0;
+        }
+        private static void ProbeMetadata(CatalogItem item)
+        {
+            try
+            {
+                Uri uri; string reason;
+                if(!TryValidatePublicHttpUri(item.Url,out uri,out reason)) {item.State="blocked";return;}
+                if(LooksLikeDirectMedia(uri)) { item.State="ready"; return; }
+                Dictionary<string,object> info=ProbeYtDlp(item.Url,false,1,20000);
+                if(info != null)
+                {
+                    string title=GetString(info,"title"), image=GetString(info,"thumbnail");
+                    if(!String.IsNullOrWhiteSpace(title)) item.Title=title;
+                    item.DurationMs=DurationMs(info);
+                    if (SafeThumbnailUrl(image)) item.ThumbnailUrl=image;
+                    item.Description=GetString(info,"description");
+                    if (item.Description!=null && item.Description.Length>500) item.Description=item.Description.Substring(0,500);
+                    item.State="ready"; return;
+                }
+                string html=FetchSmallText(uri,1024*1024);
+                // oEmbed discovery is common on video platforms; the URL itself is
+                // fetched only through the same public-address/redirect safety checks.
+                Match oe=Regex.Match(html,"<link[^>]+type\\s*=\\s*['\\\"]application/json\\+oembed['\\\"][^>]+href\\s*=\\s*['\\\"]([^'\\\"]+)",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1));
+                if (!oe.Success)
+                    oe=Regex.Match(html,"<link[^>]+href\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"][^>]+type\\s*=\\s*['\\\"]application/json\\+oembed",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1));
+                if(oe.Success)
+                {
+                    Uri oeUri;string why;
+                    if(Uri.TryCreate(uri,WebUtility.HtmlDecode(oe.Groups[1].Value),out oeUri) && TryValidatePublicHttpUri(oeUri.ToString(),out oeUri,out why))
+                    {
+                        try
+                        {
+                            Dictionary<string,object> oeInfo=Json.DeserializeObject(FetchSmallText(oeUri,256*1024)) as Dictionary<string,object>;
+                            if(oeInfo!=null)
+                            {
+                                string oeTitle=GetString(oeInfo,"title");
+                                string oeThumb=GetString(oeInfo,"thumbnail_url");
+                                if(!String.IsNullOrWhiteSpace(oeTitle)) item.Title=oeTitle;
+                                if(SafeThumbnailUrl(oeThumb)) item.ThumbnailUrl=oeThumb;
+                            }
+                        } catch(Exception) { }
+                    }
+                }
+                string titleMeta=ExtractMeta(html,"og:title|twitter:title");
+                string imageMeta=ExtractMeta(html,"og:image(?::url|:secure_url)?|twitter:image");
+                if (!String.IsNullOrEmpty(titleMeta) && (item.Title==ReadableName(uri))) item.Title=WebUtility.HtmlDecode(titleMeta);
+                Uri absolute;
+                if (String.IsNullOrEmpty(item.ThumbnailUrl) && Uri.TryCreate(uri,WebUtility.HtmlDecode(imageMeta ?? ""),out absolute) && SafeThumbnailUrl(absolute.ToString())) item.ThumbnailUrl=absolute.ToString();
+                item.State="listed";
+            }
+            catch(Exception ex) {item.State="unverified";}
+        }
+        private static string ExtractMeta(string html,string names)
+        {
+            // Handles either common attribute order. Failure is expected for many public sites.
+            Match match=Regex.Match(html,"<meta[^>]+(?:property|name)\\s*=\\s*['\\\"](?:"+names+")[\\'\\\"][^>]+content\\s*=\\s*['\\\"]([^'\\\"]+)",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1));
+            if(match.Success) return match.Groups[1].Value;
+            match=Regex.Match(html,"<meta[^>]+content\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"][^>]+(?:property|name)\\s*=\\s*['\\\"](?:"+names+")",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1));
+            return match.Success? match.Groups[1].Value:null;
+        }
+        private static bool SafeThumbnailUrl(string url)
+        {
+            Uri uri;string reason;
+            return !String.IsNullOrEmpty(url) && TryValidatePublicHttpUri(url,out uri,out reason);
+        }
+        private static void DiscoverWebsite(string website)
+        {
+            int limit=MaxItemsPerSite;
+            string source=SafeSourceName(website);
+            HashSet<string> seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<CatalogItem> added=new List<CatalogItem>();
+            // First ask any yt-dlp extractor for collection entries. Unfamiliar sites still get generic discovery.
+            Dictionary<string,object> flat=ProbeYtDlp(website,true,limit,30000);
+            object raw;
+            if(flat!=null && flat.TryGetValue("entries",out raw))
+            {
+                IEnumerable entries=raw as IEnumerable;
+                if(entries!=null)
+                foreach(object obj in entries)
+                {
+                    Dictionary<string,object> ent=obj as Dictionary<string,object>;
+                    if(ent==null || added.Count>=limit) break;
+                    string link=GetString(ent,"webpage_url") ?? GetString(ent,"original_url") ?? GetString(ent,"url");
+                    Uri resolved;
+                    if(!Uri.TryCreate(link,UriKind.Absolute,out resolved))
+                    {
+                        // Some extractors return IDs, not URLs. Prefer their own webpage_url; never guess a provider URL.
+                        continue;
+                    }
+                    if(!seen.Add(resolved.ToString())) continue;
+                    string thumb=GetString(ent,"thumbnail");
+                    CatalogItem item=AddCatalogItem(resolved.ToString(),"discovered",source,GetString(ent,"title"),SafeThumbnailUrl(thumb)?thumb:null);
+                    if(item!=null) {added.Add(item);item.State="listed";}
+                }
+            }
+            // Generic discovery always runs, including for previously unknown websites and embeds.
+            Queue<Uri> pages=new Queue<Uri>();
+            Uri root=new Uri(website);
+            pages.Enqueue(root);
+            HashSet<string> crawled=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while(pages.Count>0 && crawled.Count<MaxPagesPerSite && added.Count<limit)
+            {
+                Uri page=pages.Dequeue();
+                if(!crawled.Add(page.ToString())) continue;
+                string html;
+                try {html=FetchSmallText(page,2*1024*1024);} catch {continue;}
+                Regex anchor=new Regex("<a\\b([^>]*)>([\\s\\S]*?)</a>",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(2));
+                foreach(Match match in anchor.Matches(html))
+                {
+                    if(added.Count>=limit) break;
+                    Match href=Regex.Match(match.Groups[1].Value,"\\bhref\\s*=\\s*['\\\"]([^'\\\"]+)",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1));
+                    if(!href.Success) continue;
+                    Uri link; string reason;
+                    if(!Uri.TryCreate(page,WebUtility.HtmlDecode(href.Groups[1].Value),out link) ||
+                       !TryValidatePublicHttpUri(link.ToString(),out link,out reason)) continue;
+                    if(!seen.Add(link.ToString()) || link.Equals(page)) continue;
+                    // An arbitrary anchor may be navigation; preserve unfamiliar candidate sources without provider allowlists.
+                    string inner=match.Groups[2].Value;
+                    string label=Regex.Replace(inner,"<[^>]+>"," ").Trim();
+                    bool imageAnchor=inner.IndexOf("<img",StringComparison.OrdinalIgnoreCase)>=0;
+                    bool hinted=Regex.IsMatch(link.AbsolutePath,"video|watch|play|clip|film|vr|movie|embed|360|180|\\.(?:mp4|webm|m3u8)",RegexOptions.IgnoreCase);
+                    if(!imageAnchor && !hinted) {if(link.Host==page.Host && pages.Count<MaxPagesPerSite*2) pages.Enqueue(link); continue;}
+                    string thumb=null;
+                    Match image=Regex.Match(inner,"<img[^>]+(?:src|data-src)\\s*=\\s*['\\\"]([^'\\\"]+)",RegexOptions.IgnoreCase,TimeSpan.FromSeconds(1));
+                    Uri imageUri;
+                    if(image.Success && Uri.TryCreate(page,WebUtility.HtmlDecode(image.Groups[1].Value),out imageUri) && SafeThumbnailUrl(imageUri.ToString())) thumb=imageUri.ToString();
+                    CatalogItem item=AddCatalogItem(link.ToString(),"discovered",source,label.Length>2 && label.Length<150 ? WebUtility.HtmlDecode(label):null,thumb);
+                    if(item!=null) {added.Add(item); item.State="listed";}
+                }
+                if(page==root && pages.Count==0) break;
+            }
+            // Metadata probes are bounded; they never start media playback or download media files.
+            foreach(CatalogItem item in added.Take(20))
+            {
+                if (String.IsNullOrEmpty(item.ThumbnailUrl)) ProbeMetadata(item);
+                else item.State="ready";
+            }
+        }
+        private static string GuessStereo(string title)
+        {
+            string lower=(title??"").ToLowerInvariant();
+            if(Regex.IsMatch(lower,@"(^|[\s_\-])(sbs|side.by.side|3d.sbs)([\s_\-]|$)")) return "sbs";
+            if(Regex.IsMatch(lower,@"(^|[\s_\-])(tb|top.bottom|over.under)([\s_\-]|$)")) return "tb";
+            return "";
+        }
+        private static string GuessProjection(string title)
+        {
+            string lower=(title??"").ToLowerInvariant();
+            if(Regex.IsMatch(lower,@"(^|[^0-9])360([^0-9]|$)") || lower.Contains("vr360")) return "equirectangular360";
+            if(Regex.IsMatch(lower,@"(^|[^0-9])180([^0-9]|$)") || lower.Contains("vr180")) return "equirectangular";
+            return "";
+        }
+        private static int GuessFov(string title)
+        {
+            string p=GuessProjection(title);
+            return p=="equirectangular360"?360:p=="equirectangular"?180:0;
+        }
+        private static void HandleHereSphere(RequestData req,NetworkStream stream,string path)
+        {
+            Dictionary<string,string> header=new Dictionary<string,string>{{"HereSphere-JSON-Version","1"},{"Cache-Control","no-store"}};
+            if(path=="/heresphere" || path=="/heresphere/")
+            {
+                List<object> individual=Catalog.Values.Where(x=>x.Group=="individual").OrderBy(x=>x.Title).Select(x=>(object)(_publicBaseUrl+"/heresphere/item/"+x.Id)).ToList();
+                List<object> discovered=Catalog.Values.Where(x=>x.Group=="discovered").OrderBy(x=>x.Source).ThenBy(x=>x.Title).Select(x=>(object)(_publicBaseUrl+"/heresphere/item/"+x.Id)).ToList();
+                object body=new Dictionary<string,object>{{"access",1},{"library",new object[]{
+                    new Dictionary<string,object>{{"name","Individual Videos"},{"list",individual}},
+                    new Dictionary<string,object>{{"name","Discovered Videos"},{"list",discovered}}
+                }}};
+                WriteBytes(stream,200,"application/json; charset=utf-8",Utf8.GetBytes(Json.Serialize(body)),header);
+                return;
+            }
+            if(path.StartsWith("/heresphere/item/",StringComparison.Ordinal))
+            {
+                string id=path.Substring("/heresphere/item/".Length);
+                CatalogItem item;
+                if(!Catalog.TryGetValue(id,out item)) {WriteJson(stream,404,Error("Unknown item."));return;}
+                bool needMedia=true;
+                if(req.Method=="POST")
+                {
+                    Dictionary<string,object> data=DecodeObject(req.Body);
+                    object flag;
+                    if(data.TryGetValue("needsMediaSource",out flag) && flag is bool) needMedia=(bool)flag;
+                }
+                List<object> sources=new List<object>();
+                if(needMedia)
+                {
+                    try
+                    {
+                        Uri safe;string reason;
+                        if(TryValidatePublicHttpUri(item.Url,out safe,out reason))
+                        {
+                            ResolveResult resolved=Resolve(safe);
+                            sources.Add(new Dictionary<string,object>{{"url",resolved.VideoUrl},{"resolution",""},{"height",0},{"width",0},{"size",0L}});
+                            // Separately extracted audio tracks aren't part of HereSphere's media-source schema.
+                        }
+                    }
+                    catch(Exception ex) {Console.WriteLine("HereSphere media resolve failed: "+ex.GetType().Name);}
+                }
+                object body=new Dictionary<string,object>{
+                    {"access",1},{"title",item.Title},{"description",item.Description??""},
+                    {"thumbnailImage",_publicBaseUrl+"/thumb/"+item.Id},
+                    {"dateReleased",""},{"dateAdded",DateTime.UtcNow.ToString("yyyy-MM-dd")},
+                    {"duration",item.DurationMs},{"projection",GuessProjection(item.Title)},{"stereo",GuessStereo(item.Title)},
+                    {"fov",GuessFov(item.Title)},{"lens",""},
+                    {"isFavorite",false},{"writeFavorite",false},{"writeRating",false},{"writeTags",false},{"writeHSP",false},
+                    {"tags",new object[]{new Dictionary<string,object>{{"name", item.Group=="individual" ? "Individual Videos" : "Source: "+item.Source}}}},
+                    {"media",new object[]{new Dictionary<string,object>{{"name","Video"},{"sources",sources}}}}
+                };
+                WriteBytes(stream,200,"application/json; charset=utf-8",Utf8.GetBytes(Json.Serialize(body)),header);
+                return;
+            }
+            WriteJson(stream,404,Error("Unknown HereSphere item."));
+        }
+        private static void HandleThumb(string id,NetworkStream stream)
+        {
+            CatalogItem item;
+            if(id.Length!=24 || !Catalog.TryGetValue(id,out item)) {WriteJson(stream,404,Error("Unknown thumbnail."));return;}
+            byte[] cached;
+            string type;
+            if(ImageCache.TryGetValue(id,out cached) && ImageTypes.TryGetValue(id,out type))
+            {WriteBytes(stream,200,type,cached,new Dictionary<string,string>{{"Cache-Control","private, max-age=1800"}});return;}
+            try
+            {
+                if(!SafeThumbnailUrl(item.ThumbnailUrl)) throw new InvalidDataException("No public thumbnail URL.");
+                MediaRecord rec=new MediaRecord {Url=item.ThumbnailUrl,Headers=new Dictionary<string,string>{{"User-Agent","Mozilla/5.0"}},Label="thumbnail"};
+                using(HttpResponseMessage response=SendSafeRequest(rec,"GET",null,3))
+                {
+                    string ct=response.Content.Headers.ContentType==null?"":response.Content.Headers.ContentType.MediaType;
+                    if(ct!="image/jpeg" && ct!="image/png" && ct!="image/webp" && ct!="image/gif") throw new InvalidDataException("Non-image content.");
+                    using(Stream input=response.Content.ReadAsStreamAsync().Result)
+                    using(MemoryStream output=new MemoryStream())
+                    {
+                        byte[] buffer=new byte[16384];int len;
+                        while((len=input.Read(buffer,0,buffer.Length))>0)
+                        {if(output.Length+len>3*1024*1024)throw new InvalidDataException("Thumbnail too large.");output.Write(buffer,0,len);}
+                        cached=output.ToArray();
+                    }
+                    if (ImageCache.Count < 160) { ImageCache[id]=cached; ImageTypes[id]=ct; }
+                    WriteBytes(stream,200,ct,cached,new Dictionary<string,string>{{"Cache-Control","private, max-age=1800"}});
+                    return;
+                }
+            }
+            catch(Exception) {}
+            byte[] fallback=File.ReadAllBytes(@"C:\App\ui\placeholder.png");
+            WriteBytes(stream,200,"image/png",fallback,new Dictionary<string,string>{{"Cache-Control","no-store"}});
         }
     }
 }

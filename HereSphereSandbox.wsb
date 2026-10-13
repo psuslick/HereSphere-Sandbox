@@ -8,7 +8,7 @@
   </MappedFolders>
 
   <LogonCommand>
-    <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File C:\SandboxBootstrap\HereSphere\bootstrap.ps1</Command>
+    <Command>cmd.exe /c start "HereSphere Bootstrap" cmd.exe /k powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\SandboxBootstrap\HereSphere\bootstrap.ps1</Command>
   </LogonCommand>
 
   <Networking>Enable</Networking>
@@ -16,7 +16,7 @@
   <AudioInput>Disable</AudioInput>
   <VideoInput>Disable</VideoInput>
   <PrinterRedirection>Disable</PrinterRedirection>
-  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <ClipboardRedirection>Enable</ClipboardRedirection>
   <ProtectedClient>Enable</ProtectedClient>
   <MemoryInMB>4096</MemoryInMB>
 </Configuration>

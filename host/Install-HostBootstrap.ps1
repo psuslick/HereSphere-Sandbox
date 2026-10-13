@@ -13,6 +13,12 @@ if (-not (Test-Path -LiteralPath $config)) {
     Copy-Item -LiteralPath (Join-Path $source 'repo-config.example.psd1') -Destination $config
 }
 
+$sourceDir = Join-Path $destination 'Sources'
+New-Item -ItemType Directory -Force -Path $sourceDir | Out-Null
+foreach ($file in @('videos.txt','websites.txt')) {
+    $path = Join-Path $sourceDir $file
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType File -Path $path | Out-Null }
+}
 Write-Host "Bootstrap installed in $destination"
 Write-Host "Edit $config with your public HTTPS repository URL."
 Write-Host 'Place portable Git and yt-dlp in C:\SandboxBootstrap as described in README.md.'

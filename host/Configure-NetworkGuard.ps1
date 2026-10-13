@@ -73,7 +73,8 @@ $protected = @(
     @('0.0.0.0','0.255.255.255'),
     @('10.0.0.0','10.255.255.255'),
     @('100.64.0.0','100.127.255.255'),
-    @('127.0.0.0','127.255.255.255'),
+    # Loopback addresses are internal to the disposable guest. The admin UI
+    # requires guest-to-guest 127.0.0.1:5001 and is not reachable from host.
     @('169.254.0.0','169.254.255.255'),
     @('172.16.0.0','172.31.255.255'),
     @('192.0.0.0','192.0.0.255'),
@@ -122,7 +123,7 @@ foreach ($address in $exceptions) {
 }
 
 New-NetFirewallRule -DisplayName 'HereSphere Sandbox - Block private IPv6 egress' -Group $group `
-    -Direction Outbound -Action Block -Profile Any -RemoteAddress @('::1','fc00::/7','fe80::/10','ff00::/8','2001:db8::/32') | Out-Null
+    -Direction Outbound -Action Block -Profile Any -RemoteAddress @('fc00::/7','fe80::/10','2001:db8::/32') | Out-Null
 
 # Server ingress is permitted only from the Sandbox NAT gateway (the Windows host side of this isolated virtual subnet).
 New-NetFirewallRule -DisplayName 'HereSphere Sandbox - Allow host to TCP 5000' -Group $group `

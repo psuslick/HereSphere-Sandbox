@@ -13,3 +13,8 @@ downloads/
 *.netrc
 *.env
 !host/repo-config.example.psd1
+# Personal sources are host-only; never publish their contents
+Sources/
+host/Sources/
+videos.txt
+websites.txt
