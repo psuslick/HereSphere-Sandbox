@@ -1,0 +1,15 @@
+# Runtime material belongs only on the disposable Sandbox disk.
+*.log
+bin/
+obj/
+.vs/
+node_modules/
+runtime/
+cache/
+downloads/
+*.cookies
+*.cookie
+*.har
+*.netrc
+*.env
+!host/repo-config.example.psd1
